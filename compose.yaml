@@ -1,0 +1,13 @@
+# 毕业审核审计器
+#
+# 用法:
+#   docker compose build
+#   docker compose run --rm -T audit < examples/contested.json   # 审核(从 stdin 读 JSON)
+#   docker compose run --rm test                                 # 运行 pytest 对拍
+services:
+  audit:
+    build: .
+    # 无端口、无状态:从 stdin 读 JSON,结果写 stdout,非法输入以退出码 2 拒绝。
+  test:
+    build: .
+    entrypoint: ["python", "-m", "pytest", "-q", "tests"]

@@ -1,0 +1,10 @@
+{
+  "modules": [
+    {"id": "M1", "required": 3},
+    {"id": "M2", "required": 3}
+  ],
+  "courses": [
+    {"id": "C1", "credits": 4, "modules": ["M1", "M2"]},
+    {"id": "C2", "credits": 2, "modules": ["M1"]}
+  ]
+}
