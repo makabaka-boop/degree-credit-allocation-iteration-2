@@ -5,11 +5,21 @@
 同组至多一门课获得模块归属,其余必须标为未使用;组占用状态与各模块
 封顶学分在同一优化中联合求解,而不是先求旧最优分配再删去互斥课程。
 
+培养方案调整后,可通过 previousAssignments 携带覆盖全部课程的上次归属、
+lockedCourses 携带正式锁定(必须保持原归属)的课程 id。锁定、组占用与
+模块封顶在同一状态搜索中联合处理:锁定课程只保留原归属这一条转移,
+其余课程在当前认可清单与互斥组约束下重新联合分配。目标依次为:
+  1. 最大化封顶后计入总学分;
+  2. 最小化相对上次归属的改动门数;
+  3. 沿用既有字典序裁决(未使用排在所有模块 id 之后)。
+锁定项违反当前认可资格或彼此互斥时给出 LOCK_CONFLICT,不输出部分分配。
+
 用法:
     python3 audit.py              从标准输入读取 JSON
     python3 audit.py input.json   从文件读取 JSON
 
-退出码: 0 = 正常完成审核(结果为 PASS 或 SHORTFALL);2 = 输入非法,整份拒绝。
+退出码: 0 = 正常完成审核(结果为 PASS 或 SHORTFALL);2 = 输入非法,整份拒绝;
+        3 = LOCK_CONFLICT,锁定归属与当前规则冲突,不产生方案。
 """
 
 from __future__ import annotations
@@ -23,11 +33,13 @@ REQUIRED_MIN, REQUIRED_MAX = 1, 10
 CREDITS_MIN, CREDITS_MAX = 1, 4
 GROUPS_MAX = 3
 GROUP_COURSES_MIN, GROUP_COURSES_MAX = 2, 3
+LOCKED_MIN, LOCKED_MAX = 0, 16
 
-TOP_FIELDS = {"modules", "courses", "exclusiveGroups"}
+TOP_FIELDS = {"modules", "courses", "exclusiveGroups", "previousAssignments", "lockedCourses"}
 MODULE_FIELDS = {"id", "required"}
 COURSE_FIELDS = {"id", "credits", "modules"}
 GROUP_FIELDS = {"courses"}
+PREVIOUS_FIELDS = {"course", "module"}
 
 # 并列比较用的记号:已归属 -> (0, 模块id);未使用 -> (1, ""),排在所有模块 id 之后。
 UNUSED_TOKEN = (1, "")
@@ -35,6 +47,15 @@ UNUSED_TOKEN = (1, "")
 
 class InputError(Exception):
     """输入不合法,整份拒绝。"""
+
+
+class LockConflict(Exception):
+    """输入结构合法,但锁定归属与当前认可资格或互斥组冲突。"""
+
+    def __init__(self, message, ineligible=None, groups=None):
+        super().__init__(message)
+        self.ineligible = ineligible or []
+        self.groups = groups or []
 
 
 def _is_id(value):
@@ -61,8 +82,13 @@ def validate(data):
     """校验已解析的 JSON,返回 (modules, courses, groups);不合法则抛 InputError。
 
     groups 为 None 表示输入未传 exclusiveGroups;传入空数组则为 []。
+    注意:本函数只做结构校验,previousAssignments / lockedCourses 不在此处理;
+    入口 main 使用 validate_full 一并校验它们。
     """
-    _check_fields(data, TOP_FIELDS, "input", optional=("exclusiveGroups",))
+    _check_fields(
+        data, TOP_FIELDS, "input",
+        optional=("exclusiveGroups", "previousAssignments", "lockedCourses"),
+    )
 
     raw_modules = data["modules"]
     raw_courses = data["courses"]
@@ -158,19 +184,118 @@ def validate(data):
     return modules, courses, groups
 
 
-def solve(modules, courses, groups=None):
+def validate_full(data):
+    """整份输入校验,返回 (modules, courses, groups, previous, locked)。
+
+    previous 为 None 表示未传 previousAssignments;否则为 {课程id: 模块id或None},
+    覆盖全部课程。locked 为课程 id 集合(未传 lockedCourses 时为空集)。
+    结构问题抛 InputError;结构合法但锁定项违反当前认可资格或彼此互斥时
+    抛 LockConflict(LOCK_CONFLICT,不输出部分分配)。
+    """
+    modules, courses, groups = validate(data)
+    module_ids = {m["id"] for m in modules}
+    course_ids = [c["id"] for c in courses]
+    course_set = set(course_ids)
+    elig = {c["id"]: set(c["modules"]) for c in courses}
+
+    previous = None
+    if "previousAssignments" in data:
+        raw_previous = data["previousAssignments"]
+        if not isinstance(raw_previous, list):
+            raise InputError("previousAssignments must be a list")
+        previous = {}
+        for entry in raw_previous:
+            _check_fields(entry, PREVIOUS_FIELDS, "previous assignment")
+            cid, mid = entry["course"], entry["module"]
+            if not _is_id(cid):
+                raise InputError(
+                    "previous assignment: course id must be a non-empty ASCII string"
+                )
+            if cid not in course_set:
+                raise InputError(f"previous assignment: unknown course {cid!r}")
+            if cid in previous:
+                raise InputError(f"previous assignment: duplicate course {cid!r}")
+            if mid is not None and not _is_id(mid):
+                raise InputError(
+                    "previous assignment: module must be a module id or null"
+                )
+            if mid is not None and mid not in module_ids:
+                raise InputError(f"previous assignment: unknown module {mid!r}")
+            previous[cid] = mid
+        missing = sorted(course_set - set(previous))
+        if missing:
+            raise InputError(
+                f"previousAssignments must cover every course; missing: "
+                f"{', '.join(missing)}"
+            )
+
+    locked = set()
+    if "lockedCourses" in data:
+        raw_locked = data["lockedCourses"]
+        if not isinstance(raw_locked, list) or not LOCKED_MIN <= len(raw_locked) <= LOCKED_MAX:
+            raise InputError(
+                f"lockedCourses must be a list of at most {LOCKED_MAX} entries"
+            )
+        for cid in raw_locked:
+            if not _is_id(cid):
+                raise InputError(
+                    "lockedCourses: course id must be a non-empty ASCII string"
+                )
+            if cid not in course_set:
+                raise InputError(f"lockedCourses: unknown course {cid!r}")
+            if cid in locked:
+                raise InputError(f"lockedCourses: duplicate course {cid!r}")
+            locked.add(cid)
+        if locked and previous is None:
+            raise InputError(
+                "lockedCourses requires previousAssignments covering every course"
+            )
+
+    if locked:
+        # 锁定课程必须保持原归属:原归属模块已不在当前认可清单 -> LOCK_CONFLICT。
+        ineligible = sorted(
+            cid for cid in locked if previous[cid] is not None
+            and previous[cid] not in elig[cid]
+        )
+        # 同互斥组两门及以上锁定课都被锁定到某个模块 -> 彼此冲突。
+        group_conflicts = []
+        for group in groups or []:
+            survivors = sorted(cid for cid in group if cid in locked
+                               and previous[cid] is not None)
+            if len(survivors) >= 2:
+                group_conflicts.append({"courses": list(group), "locked": survivors})
+        if ineligible or group_conflicts:
+            raise LockConflict(
+                "locked assignments conflict with current eligibility or "
+                "exclusive groups",
+                ineligible=ineligible,
+                groups=group_conflicts,
+            )
+
+    return modules, courses, groups, previous, locked
+
+
+def solve(modules, courses, groups=None, previous=None, locked=None):
     """返回审核结果字典。
 
     规则:每门课只能完整分给一个合格模块或不使用;各模块计入学分以要求值封顶;
-    同一互斥组内至多一门课获得模块归属,其余必须标为未使用;先最大化计入总学分,
-    再按课程 id 顺序取归属模块 id 序列字典序最小者(未使用排在最后)。
+    同一互斥组内至多一门课获得模块归属,其余必须标为未使用。
+
+    previous 为 {课程id: 模块id或None} 时携带上次归属,locked 为锁定课程 id
+    集合(锁定课只允许保留原归属这一条转移)。锁定、组占用与模块封顶在同一
+    状态搜索中联合转移,而非先求旧最优再把课程挪回去。目标依次为:
+      1. 最大化计入总学分(各模块计入学分之和);
+      2. 最小化相对上次归属的改动门数;
+      3. 按课程 id 顺序取归属模块 id 序列字典序最小者(未使用排在最后)。
 
     groups 为 None 表示输入未传 exclusiveGroups,输出不带该键;
-    传入空列表则输出 "exclusiveGroups": []。
+    传入空列表则输出 "exclusiveGroups": []。previous/locked 给出时输出
+    额外带 changedCount 与 changes(实际变动及其前后归属)。
     """
     reqs = [m["required"] for m in modules]
     index = {m["id"]: i for i, m in enumerate(modules)}
     ordered = sorted(courses, key=lambda c: c["id"])
+    locked = locked or set()
 
     # 每门课所在的互斥组下标(不在任何组内为 -1)。
     group_of = {}
@@ -179,22 +304,36 @@ def solve(modules, courses, groups=None):
             group_of[cid] = gi
 
     # 动态规划:状态 = (各模块已计入(封顶后)学分元组, 组占用位掩码)
-    #   -> 达到该状态的最小归属记号序列。
+    #   -> 达到该状态的 (改动门数, 归属记号序列) 中字典序最小者。
     # 位掩码第 g 位为 1 表示第 g 组已有一门课获得归属,同组其余课只能未使用;
-    # 组占用与模块封顶在同一状态里联合转移,而非先求旧最优再删去互斥课程。
-    # 同一状态保留字典序最小的前缀即可,因为后续课程的可选转移只取决于状态。
-    dp = {((0,) * len(modules), 0): ()}
+    # 锁定课程只保留原归属一条转移;组占用、锁定与模块封顶在同一状态里联合
+    # 转移,而非先求旧最优再把锁定课程挪回去。同一状态只需保留 (改动数, 序列)
+    # 最小的前缀:后续可选转移只取决于状态,而改动数与序列按课程可加、按前缀
+    # 单调,被淘汰前缀不可能在更长课程上反超。
+    dp = {((0,) * len(modules), 0): (0, ())}
     for course in ordered:
+        cid = course["id"]
         credits = course["credits"]
-        gi = group_of.get(course["id"], -1)
-        options = [(UNUSED_TOKEN, None)]
-        options += [((0, mid), index[mid]) for mid in course["modules"]]
+        gi = group_of.get(cid, -1)
+        if cid in locked:
+            # 正式锁定:仅保留原归属这一条(资格/互斥冲突已由 validate_full 预检)。
+            old = previous[cid]
+            options = [(UNUSED_TOKEN, None)] if old is None else [((0, old), index[old])]
+        else:
+            options = [(UNUSED_TOKEN, None)]
+            options += [((0, mid), index[mid]) for mid in course["modules"]]
         nxt = {}
-        for (state, mask), seq in dp.items():
+        for (state, mask), (changes, seq) in dp.items():
             for token, mi in options:
                 if mi is not None and gi >= 0 and (mask >> gi) & 1:
                     continue  # 同组已有一门课归属模块,本课只能未使用
-                cand = seq + (token,)
+                if previous is not None and cid not in locked:
+                    old_token = UNUSED_TOKEN if previous[cid] is None else (0, previous[cid])
+                    delta = 0 if token == old_token else 1
+                else:
+                    delta = 0
+                cand_changes = changes + delta
+                cand_seq = seq + (token,)
                 if mi is None:
                     key = (state, mask)
                 else:
@@ -202,13 +341,17 @@ def solve(modules, courses, groups=None):
                     cap = reqs[mi]
                     new_state = state[:mi] + (grown if grown < cap else cap,) + state[mi + 1:]
                     key = (new_state, mask | (1 << gi) if gi >= 0 else mask)
-                prev = nxt.get(key)
-                if prev is None or cand < prev:
+                cand = (cand_changes, cand_seq)
+                prev_best = nxt.get(key)
+                if prev_best is None or cand < prev_best:
                     nxt[key] = cand
         dp = nxt
 
+    # 三级裁决:总学分最大 -> 改动门数最少 -> 归属记号序列字典序最小。
     best_total = max(sum(state) for state, _ in dp)
-    best_seq = min(seq for (state, _), seq in dp.items() if sum(state) == best_total)
+    best_changes, best_seq = min(
+        value for (state, _), value in dp.items() if sum(state) == best_total
+    )
 
     assignment = {}
     raw_sums = [0] * len(modules)
@@ -250,12 +393,32 @@ def solve(modules, courses, groups=None):
             }
             for group in groups
         ]
+    if previous is not None:
+        # 实际变动及其前后归属;锁定课保持原归属,必然不在其中。
+        changes = [
+            {"course": c["id"], "from": previous[c["id"]], "to": assignment[c["id"]]}
+            for c in ordered
+            if previous[c["id"]] != assignment[c["id"]]
+        ]
+        result["changedCount"] = best_changes
+        result["changes"] = changes
     return result
 
 
 def _fail(message):
     sys.stderr.write(json.dumps({"error": message}, ensure_ascii=False) + "\n")
     return 2
+
+
+def _lock_conflict(exc):
+    # LOCK_CONFLICT:结构合法,但锁定归属与当前规则冲突;stdout 不产生部分分配。
+    sys.stderr.write(json.dumps({
+        "error": "LOCK_CONFLICT",
+        "message": str(exc),
+        "ineligible": exc.ineligible,
+        "groups": exc.groups,
+    }, ensure_ascii=False) + "\n")
+    return 3
 
 
 def main(argv):
@@ -273,11 +436,16 @@ def main(argv):
         return _fail(f"input is not valid JSON: {exc}")
 
     try:
-        modules, courses, groups = validate(data)
+        modules, courses, groups, previous, locked = validate_full(data)
     except InputError as exc:
         return _fail(str(exc))
+    except LockConflict as exc:
+        return _lock_conflict(exc)
 
-    json.dump(solve(modules, courses, groups), sys.stdout, ensure_ascii=False, indent=2)
+    json.dump(
+        solve(modules, courses, groups, previous, locked),
+        sys.stdout, ensure_ascii=False, indent=2,
+    )
     sys.stdout.write("\n")
     return 0
 

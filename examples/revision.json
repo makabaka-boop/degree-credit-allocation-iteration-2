@@ -1,0 +1,20 @@
+{
+  "modules": [
+    {"id": "M1", "required": 2},
+    {"id": "M2", "required": 2}
+  ],
+  "courses": [
+    {"id": "C1", "credits": 2, "modules": ["M1", "M2"]},
+    {"id": "C2", "credits": 2, "modules": ["M2"]},
+    {"id": "C3", "credits": 2, "modules": ["M1", "M2"]}
+  ],
+  "exclusiveGroups": [
+    {"courses": ["C1", "C2"]}
+  ],
+  "previousAssignments": [
+    {"course": "C1", "module": "M1"},
+    {"course": "C2", "module": "M2"},
+    {"course": "C3", "module": "M1"}
+  ],
+  "lockedCourses": ["C2"]
+}

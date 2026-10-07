@@ -7,7 +7,8 @@
 services:
   audit:
     build: .
-    # 无端口、无状态:从 stdin 读 JSON,结果写 stdout,非法输入以退出码 2 拒绝。
+    # 无端口、无状态:从 stdin 读 JSON,结果写 stdout;非法输入退出码 2,
+    # 锁定归属冲突 LOCK_CONFLICT 退出码 3。
   test:
     build: .
     entrypoint: ["python", "-m", "pytest", "-q", "tests"]

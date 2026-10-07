@@ -21,39 +21,64 @@ AUDIT_PY = ROOT / "audit.py"
 
 # ---------------------------------------------------------------- 暴力参照
 
-def brute_force(modules, courses, groups=None):
-    """独立参照:枚举所有归属组合,先比计入总学分,再比归属记号序列。"""
+def brute_force(modules, courses, groups=None, previous=None, locked=frozenset()):
+    """独立参照:枚举所有归属组合,依次比计入总学分、改动门数、归属记号序列。
+
+    给出 previous(覆盖全部课程的 {课程id: 模块id或None})与 locked 时,
+    锁定课程只枚举其原归属;无任何可行组合(锁定到不合格模块或同组两门
+    锁定到模块)时返回 "LOCK_CONFLICT" 哨兵。
+    """
     reqs = [m["required"] for m in modules]
     index = {m["id"]: i for i, m in enumerate(modules)}
     ordered = sorted(courses, key=lambda c: c["id"])
+    locked = set(locked)
 
-    best = None  # (total, seq, combo)
-    option_lists = [[None, *course["modules"]] for course in ordered]
+    best = None  # ((-total, changes, seq), combo, total)
+    option_lists = []
+    for course in ordered:
+        if course["id"] in locked:
+            option_lists.append([previous[course["id"]]])
+        else:
+            option_lists.append([None, *course["modules"]])
+    feasible = False
     for combo in itertools.product(*option_lists):
+        assigned_ids = {
+            course["id"] for course, choice in zip(ordered, combo) if choice is not None
+        }
         if groups:
             # 互斥约束:同组不得有两门及以上同时获得模块归属。
-            assigned_ids = {
-                course["id"] for course, choice in zip(ordered, combo) if choice is not None
-            }
             if any(
                 sum(1 for cid in group if cid in assigned_ids) > 1 for group in groups
             ):
                 continue
+        # 锁定(或任何枚举)归属必须在当前认可清单内。
+        if any(
+            choice is not None and choice not in course["modules"]
+            for course, choice in zip(ordered, combo)
+        ):
+            continue
+        feasible = True
         sums = [0] * len(modules)
         for course, choice in zip(ordered, combo):
             if choice is not None:
                 sums[index[choice]] += course["credits"]
         total = sum(min(req, got) for req, got in zip(reqs, sums))
+        changes = 0 if previous is None else sum(
+            1 for course, choice in zip(ordered, combo) if choice != previous[course["id"]]
+        )
         # 与 audit.py 相同的记号:未使用 (1, "") 排在任何模块 id (0, mid) 之后。
         seq = tuple((1, "") if choice is None else (0, choice) for choice in combo)
-        if best is None or total > best[0] or (total == best[0] and seq < best[1]):
-            best = (total, seq, combo)
+        key = (-total, changes, seq)
+        if best is None or key < best[0]:
+            best = (key, combo, total)
 
-    assignment = {course["id"]: choice for course, choice in zip(ordered, best[2])}
-    return render(modules, ordered, assignment, groups)
+    if not feasible:
+        return "LOCK_CONFLICT"
+    assignment = {course["id"]: choice for course, choice in zip(ordered, best[1])}
+    return render(modules, ordered, assignment, groups, previous)
 
 
-def render(modules, ordered_courses, assignment, groups=None):
+def render(modules, ordered_courses, assignment, groups=None, previous=None):
     """把归属方案渲染成与 audit.solve 相同结构的结果,便于整体比对。"""
     sums = {m["id"]: 0 for m in modules}
     for course in ordered_courses:
@@ -89,6 +114,14 @@ def render(modules, ordered_courses, assignment, groups=None):
             }
             for group in groups
         ]
+    if previous is not None:
+        changes = [
+            {"course": c["id"], "from": previous[c["id"]], "to": assignment[c["id"]]}
+            for c in ordered_courses
+            if previous[c["id"]] != assignment[c["id"]]
+        ]
+        result["changedCount"] = len(changes)
+        result["changes"] = changes
     return result
 
 
@@ -330,6 +363,194 @@ def test_empty_exclusive_groups_adds_empty_output_list():
     assert result == {**plain, "exclusiveGroups": []}
 
 
+# --------------------------------------------------- 培养方案调整:归属与锁定
+
+def test_previous_assignment_minimizes_changes_on_tie():
+    """二级目标压过字典序:总学分并列时保留上次归属,哪怕字典序更差。"""
+    modules = [{"id": "A", "required": 1}, {"id": "B", "required": 1}]
+    courses = [{"id": "X", "credits": 1, "modules": ["A", "B"]}]
+    plain = audit.solve(modules, courses)
+    assert plain["assignments"] == [{"course": "X", "module": "A"}]
+    result = audit.solve(modules, courses, None, {"X": "B"})
+    assert result["assignments"] == [{"course": "X", "module": "B"}]
+    assert result["changedCount"] == 0
+    assert result["changes"] == []
+
+
+def test_previous_assignment_does_not_sacrifice_counted_credits():
+    """一级目标优先:为保留归属而少计学分不允许,必须改动以最大化总学分。"""
+    modules = [{"id": "M1", "required": 2}, {"id": "M2", "required": 2}]
+    courses = [
+        {"id": "C1", "credits": 2, "modules": ["M1", "M2"]},
+        {"id": "C2", "credits": 2, "modules": ["M1"]},
+    ]
+    result = audit.solve(modules, courses, None, {"C1": "M1", "C2": "M1"})
+    # 保留 C1->M1 只能计 2;改派 C1->M2 计 4,故必须改 1 门。
+    assert result["total_counted"] == 4
+    assert result["changedCount"] == 1
+    assert result["changes"] == [{"course": "C1", "from": "M1", "to": "M2"}]
+
+
+def test_changes_listed_with_before_and_after_in_course_id_order():
+    """输出只列实际变动,给出前后归属,并按课程 id 排序。"""
+    modules = [{"id": "A", "required": 1}, {"id": "B", "required": 1}]
+    courses = [
+        {"id": "C1", "credits": 1, "modules": ["A"]},
+        {"id": "C2", "credits": 1, "modules": ["A", "B"]},
+    ]
+    # 无 revision 时 C2->A(溢出);上次 C2->B 必须改回 A? 不:C2->B 也计满,
+    # 总学分相同且零改动,故保留 C2->B,changes 为空。
+    kept = audit.solve(modules, courses, None, {"C1": "A", "C2": "B"})
+    assert kept["changes"] == [] and kept["changedCount"] == 0
+    # 上次 C1->A、C2 未使用:C2 需改派到 B 才能达标(1 门变动,含 null 前后值)。
+    result = audit.solve(modules, courses, None, {"C1": "A", "C2": None})
+    assert result["status"] == "PASS"
+    assert result["changedCount"] == 1
+    assert result["changes"] == [{"course": "C2", "from": None, "to": "B"}]
+
+
+def test_lexicographic_rule_still_breaks_remaining_ties():
+    """改动门数也并列时,沿用既有字典序裁决。"""
+    modules = [{"id": "M2", "required": 1}, {"id": "M10", "required": 1}]
+    courses = [{"id": "X", "credits": 1, "modules": ["M2", "M10"]}]
+    # 上次未使用:无论派到哪个模块都恰好改 1 门,字典序选 "M10" < "M2"。
+    result = audit.solve(modules, courses, None, {"X": None})
+    assert result["assignments"] == [{"course": "X", "module": "M10"}]
+    assert result["changes"] == [{"course": "X", "from": None, "to": "M10"}]
+
+
+def test_locked_course_has_only_its_old_assignment_in_the_joint_search():
+    """锁定课在联合搜索中只剩原归属一条转移,其余课程围绕它重新分配。
+
+    不能先求无锁定最优(C1->M1、C3->M2、C2 未使用)再把 C2 挪回 M2:
+    那样同组两门同时归属。联合结果必须是 C2->M2(锁定)、C3->M1、C1 未使用。
+    """
+    modules = [{"id": "M1", "required": 2}, {"id": "M2", "required": 2}]
+    courses = [
+        {"id": "C1", "credits": 2, "modules": ["M1", "M2"]},
+        {"id": "C2", "credits": 2, "modules": ["M2"]},
+        {"id": "C3", "credits": 2, "modules": ["M1", "M2"]},
+    ]
+    groups = [["C1", "C2"]]
+    previous = {"C1": "M1", "C2": "M2", "C3": "M1"}
+    result = audit.solve(modules, courses, groups, previous, {"C2"})
+    assert result["status"] == "PASS"
+    assert result["total_counted"] == 4
+    assert result["assignments"] == [
+        {"course": "C1", "module": None},
+        {"course": "C2", "module": "M2"},
+        {"course": "C3", "module": "M1"},
+    ]
+    # 只改了 C1 一门;锁定的 C2 不出现在 changes 中。
+    assert result["changedCount"] == 1
+    assert result["changes"] == [{"course": "C1", "from": "M1", "to": None}]
+    assert result["exclusiveGroups"] == [{"courses": ["C1", "C2"], "counted": "C2"}]
+
+
+def test_lock_can_flip_pass_into_shortfall():
+    """锁定不保证达标:锁到低价值归属时总学分下降,达标状态翻转。"""
+    modules = [{"id": "M1", "required": 2}, {"id": "M2", "required": 2}]
+    courses = [
+        {"id": "C1", "credits": 2, "modules": ["M1", "M2"]},
+        {"id": "C2", "credits": 2, "modules": ["M1"]},
+    ]
+    plain = audit.solve(modules, courses)
+    assert plain["status"] == "PASS"
+    # C1 锁到 M1:M1 被 C1/C2 填满到 2(封顶),M2 无课可填 -> SHORTFALL。
+    result = audit.solve(
+        modules, courses, None, {"C1": "M1", "C2": "M1"}, {"C1"}
+    )
+    assert result["status"] == "SHORTFALL"
+    assert result["total_counted"] == 2
+    assert [a["module"] for a in result["assignments"]] == ["M1", "M1"]
+    # 锁定课不能动,changes 为空(方案变化来自约束,不来自归属改动)。
+    assert result["changes"] == []
+
+
+def test_locked_null_assignment_is_kept_unused():
+    """上次未使用且被正式锁定:该课必须保持未使用,由其余课补救。"""
+    modules = [{"id": "A", "required": 1}, {"id": "B", "required": 1}]
+    courses = [
+        {"id": "X", "credits": 1, "modules": ["A", "B"]},
+        {"id": "Y", "credits": 1, "modules": ["B"]},
+    ]
+    result = audit.solve(
+        modules, courses, None, {"X": None, "Y": "B"}, {"X"}
+    )
+    assert result["assignments"] == [
+        {"course": "X", "module": None},
+        {"course": "Y", "module": "B"},
+    ]
+    assert result["status"] == "SHORTFALL"
+    assert result["changes"] == []
+
+
+def test_lock_conflict_ineligible_raises_and_others_remain_free():
+    """锁定模块已移出认可清单 -> LockConflict(ineligible),与互斥无关。"""
+    modules = [{"id": "M1", "required": 2}, {"id": "M2", "required": 2}]
+    courses = [
+        {"id": "C1", "credits": 2, "modules": ["M2"]},
+        {"id": "C2", "credits": 2, "modules": ["M1"]},
+    ]
+    previous = {"C1": "M1", "C2": "M1"}  # C1 上次在 M1,新清单只认可 M2
+    with pytest.raises(audit.LockConflict) as exc:
+        audit.validate_full({
+            "modules": modules,
+            "courses": courses,
+            "previousAssignments": [
+                {"course": cid, "module": previous[cid]} for cid in previous
+            ],
+            "lockedCourses": ["C1"],
+        })
+    assert exc.value.ineligible == ["C1"]
+    assert exc.value.groups == []
+
+
+def test_lock_conflict_within_exclusive_group_reports_survivors():
+    """同互斥组两门课都锁定到模块 -> 彼此冲突,LOCK_CONFLICT 指明双方。"""
+    modules = [{"id": "M1", "required": 2}, {"id": "M2", "required": 2}]
+    courses = [
+        {"id": "C1", "credits": 2, "modules": ["M1"]},
+        {"id": "C2", "credits": 2, "modules": ["M2"]},
+    ]
+    with pytest.raises(audit.LockConflict) as exc:
+        audit.validate_full({
+            "modules": modules,
+            "courses": courses,
+            "exclusiveGroups": [{"courses": ["C1", "C2"]}],
+            "previousAssignments": [
+                {"course": "C1", "module": "M1"},
+                {"course": "C2", "module": "M2"},
+            ],
+            "lockedCourses": ["C1", "C2"],
+        })
+    assert exc.value.groups == [{"courses": ["C1", "C2"], "locked": ["C1", "C2"]}]
+    assert exc.value.ineligible == []
+
+
+def test_locking_one_group_member_to_null_is_not_a_group_conflict():
+    """组内只有一门锁定到模块(另一门锁定为未使用)不构成彼此冲突。"""
+    modules = [{"id": "M1", "required": 2}, {"id": "M2", "required": 2}]
+    courses = [
+        {"id": "C1", "credits": 2, "modules": ["M1"]},
+        {"id": "C2", "credits": 2, "modules": ["M1"]},
+    ]
+    _, _, groups, previous, locked = audit.validate_full({
+        "modules": modules,
+        "courses": courses,
+        "exclusiveGroups": [{"courses": ["C1", "C2"]}],
+        "previousAssignments": [
+            {"course": "C1", "module": "M1"},
+            {"course": "C2", "module": None},
+        ],
+        "lockedCourses": ["C1", "C2"],
+    })
+    assert locked == {"C1", "C2"}
+    result = audit.solve(modules, courses, groups, previous, locked)
+    assert result["exclusiveGroups"] == [{"courses": ["C1", "C2"], "counted": "C1"}]
+    assert result["changes"] == []
+
+
 # ---------------------------------------------------------------- 穷举对拍
 
 def test_exhaustive_small_inputs():
@@ -395,6 +616,96 @@ def test_exhaustive_small_inputs_with_exclusive_groups():
     assert checked == 4 * (6 * 2 + 21 * 3 + 56 * 6)
 
 
+def _all_lock_subsets(ids):
+    return [
+        set(combo)
+        for k in range(len(ids) + 1)
+        for combo in itertools.combinations(ids, k)
+    ]
+
+
+def test_exhaustive_revisions_with_locks_and_groups():
+    """穷举对拍三级目标:小课程集合 × 全部组配置 × 全部上次归属 × 全部锁定子集。
+
+    previous 的模块取 None / "A" / "B"(可能不是该课当前认可模块,以覆盖
+    锁定到不合格模块的 LOCK_CONFLICT);锁定与互斥组交叉时暴力参照返回
+    "LOCK_CONFLICT",validate_full 必须同样识别,其余情形与 DP 整体比对。
+    同时统计达标状态翻转(PASS <-> SHORTFALL),要求穷举中确有发生。
+    """
+    course_types = [
+        (credits, elig)
+        for credits in (1, 2)
+        for elig in (("A",), ("B",), ("A", "B"))
+    ]
+    checked = 0
+    conflicts = 0
+    flips = 0
+    pass_to_shortfall = 0
+    for req_a in (1, 2):
+        for req_b in (1, 2):
+            modules = [{"id": "A", "required": req_a}, {"id": "B", "required": req_b}]
+            for n_courses in (1, 2, 3):
+                for combo in itertools.combinations_with_replacement(
+                    course_types, n_courses
+                ):
+                    courses = [
+                        {"id": f"C{i}", "credits": credits, "modules": list(elig)}
+                        for i, (credits, elig) in enumerate(combo)
+                    ]
+                    ids = [c["id"] for c in courses]
+                    for groups in group_configs(ids):
+                        plain = audit.solve(modules, courses, groups)
+                        for prev_combo in itertools.product(
+                            (None, "A", "B"), repeat=n_courses
+                        ):
+                            previous = dict(zip(ids, prev_combo))
+                            for locked in _all_lock_subsets(ids):
+                                expected = brute_force(
+                                    modules, courses, groups, previous, locked
+                                )
+                                if expected == "LOCK_CONFLICT":
+                                    conflicts += 1
+                                    payload = {
+                                        "modules": modules,
+                                        "courses": courses,
+                                        "previousAssignments": [
+                                            {"course": cid, "module": previous[cid]}
+                                            for cid in ids
+                                        ],
+                                        "lockedCourses": sorted(locked),
+                                    }
+                                    if groups is not None:
+                                        payload["exclusiveGroups"] = [
+                                            {"courses": g} for g in groups
+                                        ]
+                                    with pytest.raises(audit.LockConflict):
+                                        audit.validate_full(payload)
+                                    continue
+                                actual = audit.solve(
+                                    modules, courses, groups, previous, locked
+                                )
+                                assert actual == expected, json.dumps(
+                                    {
+                                        "modules": modules,
+                                        "courses": courses,
+                                        "groups": groups,
+                                        "previous": previous,
+                                        "locked": sorted(locked),
+                                    },
+                                    ensure_ascii=False,
+                                )
+                                checked += 1
+                                if actual["status"] != plain["status"]:
+                                    flips += 1
+                                    if plain["status"] == "PASS":
+                                        pass_to_shortfall += 1
+    # 量级固定,显式断言以防枚举被意外收窄;翻转必须真实发生(双向)。
+    assert checked == 199888
+    assert conflicts == 99776
+    assert flips > 0
+    assert pass_to_shortfall > 0
+
+
 MODULE_ID_POOL = ["A", "B", "C", "M1", "M10", "M2", "z"]
 COURSE_ID_POOL = ["C1", "C2", "C10", "c3", "X", "Y", "Z", "w"]
 
@@ -454,6 +765,60 @@ def test_randomized_differential_with_exclusive_groups():
         expected = brute_force(modules, courses, groups)
         assert actual == expected, json.dumps(
             {"modules": modules, "courses": courses, "exclusiveGroups": groups},
+            ensure_ascii=False,
+        )
+
+
+def random_revision(rng):
+    """随机培养方案调整:0–3 个互斥组 + 覆盖全部课程的上次归属 + 随机锁定。
+
+    上次归属允许引用已声明但当前不认可该课的模块(仅锁定时才冲突),
+    以便同时覆盖 LOCK_CONFLICT 与不锁定时重新分配两条路径。
+    """
+    modules, courses = random_instance(rng)
+    mids = [m["id"] for m in modules]
+    pool = [c["id"] for c in courses]
+    rng.shuffle(pool)
+    groups = []
+    for _ in range(rng.randint(0, 3)):
+        size = rng.randint(2, 3)
+        if len(pool) < size:
+            break
+        groups.append([pool.pop() for _ in range(size)])
+    previous = {c["id"]: rng.choice([None, *mids]) for c in courses}
+    locked = {c["id"] for c in courses if rng.random() < 0.35}
+    return modules, courses, groups, previous, locked
+
+
+def test_randomized_differential_with_revisions_and_locks():
+    """随机调整对拍:三级目标、组占用与锁定在同一搜索中的结果须同暴力枚举一致。"""
+    rng = random.Random(20261007)
+    for _ in range(200):
+        modules, courses, groups, previous, locked = random_revision(rng)
+        expected = brute_force(modules, courses, groups, previous, locked)
+        if expected == "LOCK_CONFLICT":
+            payload = {
+                "modules": modules,
+                "courses": courses,
+                "exclusiveGroups": [{"courses": g} for g in groups],
+                "previousAssignments": [
+                    {"course": cid, "module": previous[cid]}
+                    for cid in sorted(previous)
+                ],
+                "lockedCourses": sorted(locked),
+            }
+            with pytest.raises(audit.LockConflict):
+                audit.validate_full(payload)
+            continue
+        actual = audit.solve(modules, courses, groups, previous, locked)
+        assert actual == expected, json.dumps(
+            {
+                "modules": modules,
+                "courses": courses,
+                "exclusiveGroups": groups,
+                "previous": previous,
+                "locked": sorted(locked),
+            },
             ensure_ascii=False,
         )
 
@@ -588,6 +953,104 @@ def test_validate_rejects_invalid_exclusive_groups(payload):
         audit.validate(payload)
 
 
+# ------------------------------------------------------- 调整配置的输入校验
+
+def revision_payload():
+    return {
+        "modules": [{"id": "M1", "required": 2}, {"id": "M2", "required": 2}],
+        "courses": [
+            {"id": "C1", "credits": 2, "modules": ["M1", "M2"]},
+            {"id": "C2", "credits": 2, "modules": ["M2"]},
+            {"id": "C3", "credits": 2, "modules": ["M1"]},
+        ],
+        "previousAssignments": [
+            {"course": "C1", "module": "M1"},
+            {"course": "C2", "module": "M2"},
+            {"course": "C3", "module": None},
+        ],
+        "lockedCourses": ["C1"],
+    }
+
+
+def _invalid_revision_payloads():
+    cases = {}
+
+    def add(name, mutate):
+        payload = revision_payload()
+        mutate(payload)
+        cases[name] = payload
+
+    add("previous not a list", lambda p: p.update(previousAssignments={"C1": "M1"}))
+    add("previous missing course coverage",
+        lambda p: p["previousAssignments"].pop())
+    add("previous duplicate course",
+        lambda p: p.update(previousAssignments=[
+            {"course": "C1", "module": "M1"},
+            {"course": "C2", "module": "M2"},
+            {"course": "C3", "module": None},
+            {"course": "C3", "module": "M1"},
+        ]))
+    add("previous unknown course",
+        lambda p: p["previousAssignments"][2].update(course="C9"))
+    add("previous unknown module",
+        lambda p: p["previousAssignments"][0].update(module="M9"))
+    add("previous non-string module",
+        lambda p: p["previousAssignments"][0].update(module=7))
+    add("previous non-string course",
+        lambda p: p["previousAssignments"][0].update(course=7))
+    add("previous entry extra field",
+        lambda p: p["previousAssignments"][0].update(note="x"))
+    add("previous entry missing module",
+        lambda p: p["previousAssignments"][0].pop("module"))
+    add("previous entry not an object",
+        lambda p: p.update(previousAssignments=[["C1", "M1"], [], []]))
+    add("locked not a list", lambda p: p.update(lockedCourses="C1"))
+    add("locked unknown course", lambda p: p.update(lockedCourses=["C9"]))
+    add("locked duplicate course", lambda p: p.update(lockedCourses=["C1", "C1"]))
+    add("locked non-string course", lambda p: p.update(lockedCourses=[7]))
+    add("locked too many", lambda p: p.update(lockedCourses=["C1"] * 17))
+    add("locked without previous", lambda p: p.pop("previousAssignments"))
+    add("top-level extra field", lambda p: p.update(term="2026"))
+    return cases
+
+
+INVALID_REVISION_PAYLOADS = _invalid_revision_payloads()
+
+
+def test_validate_full_accepts_revision():
+    modules, courses, groups, previous, locked = audit.validate_full(
+        revision_payload()
+    )
+    assert groups is None
+    assert previous == {"C1": "M1", "C2": "M2", "C3": None}
+    assert locked == {"C1"}
+
+
+def test_validate_full_empty_locked_list_without_previous_is_valid():
+    """空的 lockedCourses 不依赖 previousAssignments。"""
+    payload = base_payload()
+    payload["lockedCourses"] = []
+    _, _, _, previous, locked = audit.validate_full(payload)
+    assert previous is None and locked == set()
+
+
+@pytest.mark.parametrize(
+    "payload", INVALID_REVISION_PAYLOADS.values(), ids=list(INVALID_REVISION_PAYLOADS)
+)
+def test_validate_rejects_invalid_revision(payload):
+    with pytest.raises(audit.InputError):
+        audit.validate_full(payload)
+
+
+def test_lock_conflict_is_distinct_from_input_error():
+    """资格冲突是结构合法后的独立失败类型,不应当作 InputError。"""
+    payload = revision_payload()
+    payload["courses"][0]["modules"] = ["M2"]  # C1 锁定在 M1 但新清单只认可 M2
+    with pytest.raises(audit.LockConflict) as exc:
+        audit.validate_full(payload)
+    assert exc.value.ineligible == ["C1"]
+
+
 # ---------------------------------------------------------------- 命令行
 
 def run_cli(args=(), stdin_text=None):
@@ -665,3 +1128,89 @@ def test_cli_rejects_invalid_exclusive_groups():
     assert proc.returncode == 2
     assert proc.stdout == ""
     assert "unknown course" in json.loads(proc.stderr)["error"]
+
+
+def test_cli_revision_outputs_changes_and_matches_solve():
+    """携带上次归属:正常审核,输出含 changedCount / changes。"""
+    payload = revision_payload()
+    payload.pop("lockedCourses")
+    proc = run_cli(stdin_text=json.dumps(payload))
+    assert proc.returncode == 0, proc.stderr
+    result = json.loads(proc.stdout)
+    assert result == audit.solve(*audit.validate_full(payload))
+    assert "changedCount" in result and "changes" in result
+    assert "exclusiveGroups" not in result
+
+
+def test_cli_lock_conflict_returns_3_without_partial_assignment():
+    """LOCK_CONFLICT:退出码 3、stdout 为空、stderr 给出明确结构。"""
+    payload = revision_payload()
+    payload["courses"][0]["modules"] = ["M2"]  # C1 锁在 M1 但新清单只认可 M2
+    proc = run_cli(stdin_text=json.dumps(payload))
+    assert proc.returncode == 3
+    assert proc.stdout == ""
+    err = json.loads(proc.stderr)
+    assert err["error"] == "LOCK_CONFLICT"
+    assert err["ineligible"] == ["C1"]
+    assert err["groups"] == []
+
+
+def test_cli_lock_conflict_within_exclusive_group_returns_3():
+    """互斥组内两门锁定课彼此冲突:退出码 3,groups 指明冲突组员。"""
+    payload = {
+        "modules": [{"id": "M1", "required": 2}, {"id": "M2", "required": 2}],
+        "courses": [
+            {"id": "C1", "credits": 2, "modules": ["M1"]},
+            {"id": "C2", "credits": 2, "modules": ["M2"]},
+        ],
+        "exclusiveGroups": [{"courses": ["C1", "C2"]}],
+        "previousAssignments": [
+            {"course": "C1", "module": "M1"},
+            {"course": "C2", "module": "M2"},
+        ],
+        "lockedCourses": ["C1", "C2"],
+    }
+    proc = run_cli(stdin_text=json.dumps(payload))
+    assert proc.returncode == 3
+    assert proc.stdout == ""
+    err = json.loads(proc.stderr)
+    assert err["error"] == "LOCK_CONFLICT"
+    assert err["groups"] == [{"courses": ["C1", "C2"], "locked": ["C1", "C2"]}]
+
+
+def test_cli_malformed_revision_still_returns_2():
+    """上次归属缺项属于非法输入(2),而非锁定冲突(3)。"""
+    payload = revision_payload()
+    payload["previousAssignments"].pop()
+    proc = run_cli(stdin_text=json.dumps(payload))
+    assert proc.returncode == 2
+    assert proc.stdout == ""
+    assert "error" in json.loads(proc.stderr)
+
+
+def test_cli_locked_feasible_revision_lists_only_actual_changes():
+    """锁定可行时方案正常输出,changes 列出前后归属且不含锁定课。"""
+    modules = [{"id": "M1", "required": 2}, {"id": "M2", "required": 2}]
+    courses = [
+        {"id": "C1", "credits": 2, "modules": ["M1", "M2"]},
+        {"id": "C2", "credits": 2, "modules": ["M2"]},
+        {"id": "C3", "credits": 2, "modules": ["M1", "M2"]},
+    ]
+    payload = {
+        "modules": modules,
+        "courses": courses,
+        "exclusiveGroups": [{"courses": ["C1", "C2"]}],
+        "previousAssignments": [
+            {"course": "C1", "module": "M1"},
+            {"course": "C2", "module": "M2"},
+            {"course": "C3", "module": "M1"},
+        ],
+        "lockedCourses": ["C2"],
+    }
+    proc = run_cli(stdin_text=json.dumps(payload))
+    assert proc.returncode == 0, proc.stderr
+    result = json.loads(proc.stdout)
+    assert result["status"] == "PASS"
+    assert result["exclusiveGroups"] == [{"courses": ["C1", "C2"], "counted": "C2"}]
+    assert result["changedCount"] == 1
+    assert result["changes"] == [{"course": "C1", "from": "M1", "to": None}]
